@@ -1,4 +1,4 @@
-# AI World Model V3
+# AI World Model
 
 A PyTorch-based world model that learns to simulate a video from raw footage. It estimates camera motion via optical flow, trains an autoencoder and a latent-space transition U-Net, and lets you interactively steer through the learned world using keyboard controls.
 
