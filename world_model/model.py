@@ -36,15 +36,19 @@ class Decoder(nn.Module):
 
 
 class LatentUNet(nn.Module):
-    def __init__(self, latent_channels: int = 64, action_dim: int = 4):
+    def __init__(self, latent_channels: int = 64, action_dim: int = 5):
         super().__init__()
         self.action = nn.Sequential(
             nn.Linear(action_dim, 64),
             nn.SiLU(),
             nn.Linear(64, latent_channels),
         )
-        self.norm_in = nn.GroupNorm(num_groups=min(8, latent_channels * 2), num_channels=latent_channels * 2)
-        self.down1 = nn.Conv2d(latent_channels * 2, 128, 3, padding=1)
+        in_channels = latent_channels * 2
+        num_groups = min(8, in_channels)
+        if in_channels % num_groups != 0:
+            num_groups = max(1, in_channels // 8)
+        self.norm_in = nn.GroupNorm(num_groups=num_groups, num_channels=in_channels)
+        self.down1 = nn.Conv2d(in_channels, 128, 3, padding=1)
         self.norm1 = nn.GroupNorm(8, 128)
         self.down2 = nn.Conv2d(128, 128, 4, 2, 1)
         self.mid = nn.Sequential(

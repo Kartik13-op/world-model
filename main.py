@@ -35,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     play.add_argument("--device", default=None)
     play.add_argument("--action-strength", type=float, default=1.0)
     play.add_argument("--latent-damping", type=float, default=1.0)
+    play.add_argument("--start-frame", type=int, default=-1, help="Frame index to start from (-1 = random)")
+    play.add_argument("--physics-blend", type=float, default=0.85, help="Weight of physics warp vs neural prediction (0-1)")
+    play.add_argument("--no-normalize-latent", action="store_true", help="Disable latent distribution normalization")
 
     sub.add_parser("gui", help="Open the Tkinter desktop interface.")
     return parser
@@ -81,6 +84,9 @@ def main() -> None:
             device=args.device,
             action_strength=args.action_strength,
             latent_damping=args.latent_damping,
+            start_frame=args.start_frame,
+            physics_blend=args.physics_blend,
+            normalize_latent=not args.no_normalize_latent,
         )
     elif args.command == "gui":
         from gui import main as gui_main

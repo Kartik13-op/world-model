@@ -44,13 +44,26 @@ def _estimate_camera_action(prev_gray: np.ndarray, gray: np.ndarray) -> np.ndarr
 def preprocess_video(
     project: str | Path,
     video: str | Path,
-    size: int = 128,
+    size: int = 480,
     max_frames: int | None = None,
 ) -> ProjectPaths:
     paths = create_project(project)
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video}")
+
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if orig_w <= 0 or orig_h <= 0:
+        raise RuntimeError("Invalid video dimensions")
+
+    scale = size / max(orig_w, orig_h)
+    target_w = int(orig_w * scale)
+    target_h = int(orig_h * scale)
+    target_w = target_w - (target_w % 32)
+    target_h = target_h - (target_h % 32)
+    target_w = max(32, target_w)
+    target_h = max(32, target_h)
 
     frames: list[np.ndarray] = []
     actions: list[np.ndarray] = []
@@ -68,14 +81,16 @@ def preprocess_video(
         if not ok:
             break
 
-        frame = cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+        frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if prev_gray is None:
-            actions.append(np.zeros(4, dtype=np.float32))
+            actions.append(np.zeros(5, dtype=np.float32))
         else:
-            actions.append(_estimate_camera_action(prev_gray, gray))
+            action_4d = _estimate_camera_action(prev_gray, gray)
+            action_5d = np.array([action_4d[0], action_4d[1], action_4d[2], 0.0, action_4d[3]], dtype=np.float32)
+            actions.append(action_5d)
 
         frames.append(rgb)
         prev_gray = gray
@@ -96,8 +111,9 @@ def preprocess_video(
     meta = {
         "video": str(video),
         "frame_count": int(len(frames_np)),
-        "size": int(size),
-        "action_order": ["strafe_x", "forward_z", "yaw", "zoom"],
+        "size": [int(target_w), int(target_h)],
+        "original_size": [orig_w, orig_h],
+        "action_order": ["strafe_x", "forward_z", "yaw", "pitch", "zoom"],
     }
     paths.meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return paths

@@ -17,7 +17,14 @@ class VideoPairs(Dataset):
         frames = np.load(frames_file)
         actions = np.load(actions_file)
         self.frames = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0
-        self.actions = torch.from_numpy(actions).float()
+        actions_tensor = torch.from_numpy(actions).float()
+        if actions_tensor.shape[1] == 4:
+            # Dynamically upgrade 4D action file (strafe, forward, yaw, zoom) 
+            # to 5D action file (strafe, forward, yaw, pitch=0, zoom)
+            strafe, forward, yaw, zoom = actions_tensor.unbind(dim=1)
+            pitch = torch.zeros_like(strafe)
+            actions_tensor = torch.stack([strafe, forward, yaw, pitch, zoom], dim=1)
+        self.actions = actions_tensor
 
     def __len__(self) -> int:
         return len(self.frames) - 1
@@ -33,6 +40,7 @@ def make_synthetic_camera_batch(images: torch.Tensor, strength: float) -> tuple[
     strafe = torch.empty(batch, device=device).uniform_(-1.0, 1.0)
     forward = torch.empty(batch, device=device).uniform_(-1.0, 1.0)
     yaw = torch.empty(batch, device=device).uniform_(-1.0, 1.0)
+    pitch = torch.zeros(batch, device=device)
     zoom = torch.empty(batch, device=device).uniform_(0.5, 1.5) * forward * 0.3
 
     scale = 1.0 - zoom * strength
@@ -50,7 +58,7 @@ def make_synthetic_camera_batch(images: torch.Tensor, strength: float) -> tuple[
 
     grid = F.affine_grid(theta, images.shape, align_corners=False)
     warped = F.grid_sample(images, grid, mode="bilinear", padding_mode="border", align_corners=False)
-    action = torch.stack([strafe, forward, yaw, zoom], dim=1)
+    action = torch.stack([strafe, forward, yaw, pitch, zoom], dim=1)
     return warped, action
 
 
@@ -58,6 +66,8 @@ def _free_memory(device: str) -> None:
     gc.collect()
     if "cuda" in device:
         torch.cuda.empty_cache()
+    elif "mps" in device:
+        torch.mps.empty_cache()
 
 
 def train_world_model(
@@ -71,20 +81,34 @@ def train_world_model(
     device: str | None = None,
     synthetic_controls: bool = True,
     synthetic_strength: float = 0.12,
+    grad_checkpoint: bool = True,
 ) -> Path:
     paths = ProjectPaths(Path(project))
     if not paths.frames_file.exists() or not paths.actions_file.exists():
         raise RuntimeError("Run preprocess before training.")
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # CRITICAL: Prevent CPU/Laptop freezing by limiting PyTorch CPU threads
+    if "cpu" in device.lower():
+        torch.set_num_threads(4)  # Use only 4 threads to keep system fully responsive
+        torch.set_num_interop_threads(1)
+        print("System safety limit: restricted PyTorch CPU training to 4 threads.")
+
     dataset = VideoPairs(paths.frames_file, paths.actions_file)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=0, pin_memory=False)
 
     model = WorldModel(latent_channels=latent_channels).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr * accum_steps, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * accum_steps * 0.01)
+    if grad_checkpoint and hasattr(model.transition, "gradient_checkpointing_enable"):
+        model.transition.gradient_checkpointing_enable()
+
+    effective_lr = lr * accum_steps
+    opt = torch.optim.AdamW(model.parameters(), lr=effective_lr, weight_decay=1e-5, foreach=False)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=effective_lr * 0.05)
     l1 = nn.L1Loss()
     mse = nn.MSELoss()
+
+    scaler = torch.amp.GradScaler("cuda", enabled=("cuda" in device))
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -98,33 +122,36 @@ def train_world_model(
             nxt = nxt.to(device, non_blocking=True)
             action = action.to(device, non_blocking=True)
 
-            z = model.encode(current)
-            z_next = model.encode(nxt).detach()
-            recon = model.decode(z)
-            predicted_z = model.step(z, action)
-            predicted_frame = model.decode(predicted_z)
+            with torch.autocast(device_type=device.split(":")[0], enabled=("cuda" in device)):
+                z = model.encode(current)
+                z_next = model.encode(nxt).detach()
+                recon = model.decode(z)
+                predicted_z = model.step(z, action)
+                predicted_frame = model.decode(predicted_z)
 
-            loss_recon = l1(recon, current)
-            loss_latent = mse(predicted_z, z_next)
-            loss_frame = l1(predicted_frame, nxt)
-            loss = loss_recon + loss_frame + 0.25 * loss_latent
+                loss_recon = l1(recon, current)
+                loss_latent = mse(predicted_z, z_next)
+                loss_frame = l1(predicted_frame, nxt)
+                loss = loss_recon + loss_frame + 0.25 * loss_latent
 
-            if synthetic_controls:
-                synth_n = max(1, batch_size // 2)
-                synth_next, synth_action = make_synthetic_camera_batch(
-                    current[:synth_n], synthetic_strength
-                )
-                z_synth = model.encode(current[:synth_n])
-                synth_z_next = model.encode(synth_next).detach()
-                synth_predicted_z = model.step(z_synth, synth_action)
-                synth_predicted_frame = model.decode(synth_predicted_z)
-                loss = loss + l1(synth_predicted_frame, synth_next) + 0.25 * mse(synth_predicted_z, synth_z_next)
+                if synthetic_controls:
+                    synth_n = max(1, min(batch_size // 2, current.shape[0]))
+                    synth_next, synth_action = make_synthetic_camera_batch(
+                        current[:synth_n], synthetic_strength
+                    )
+                    z_synth = model.encode(current[:synth_n])
+                    synth_z_next = model.encode(synth_next).detach()
+                    synth_predicted_z = model.step(z_synth, synth_action)
+                    synth_predicted_frame = model.decode(synth_predicted_z)
+                    loss = loss + l1(synth_predicted_frame, synth_next) + 0.25 * mse(synth_predicted_z, synth_z_next)
 
-            (loss / accum_steps).backward()
+            scaler.scale(loss / accum_steps).backward()
 
             if (step_idx + 1) % accum_steps == 0 or (step_idx + 1) == len(loader):
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
                 opt.zero_grad(set_to_none=True)
 
             total += float(loss.item())
@@ -142,32 +169,35 @@ def train_world_model(
                 nxt = nxt.to(device, non_blocking=True)
                 action = action.to(device, non_blocking=True)
 
-                z = model.encode(current)
-                z = model.step(z, action)
-                z_target = model.encode(nxt).detach()
-                frame_pred = model.decode(z)
-                rloss = mse(z, z_target) + l1(frame_pred, nxt)
+                with torch.autocast(device_type=device.split(":")[0], enabled=("cuda" in device)):
+                    z = model.encode(current)
+                    z = model.step(z, action)
+                    z_target = model.encode(nxt).detach()
+                    frame_pred = model.decode(z)
+                    rloss = mse(z, z_target) + l1(frame_pred, nxt)
 
-                z = z.detach()
-                z2 = model.step(z, action)
-                z2_target = model.encode(current).detach()
-                rloss = rloss + mse(z2, z2_target) * 0.5
+                    z = z.detach()
+                    z2 = model.step(z, action)
+                    z2_target = model.encode(nxt).detach()
+                    rloss = rloss + mse(z2, z2_target) * 0.5
 
-                if synthetic_controls:
-                    synth_n = max(1, current.shape[0] // 2)
-                    synth_next, synth_action = make_synthetic_camera_batch(
-                        current[:synth_n], synthetic_strength
-                    )
-                    z_synth = model.encode(current[:synth_n])
-                    synth_z_pred = model.step(z_synth, synth_action)
-                    synth_z_target = model.encode(synth_next).detach()
-                    rloss = rloss + mse(synth_z_pred, synth_z_target) * 0.5
+                    if synthetic_controls:
+                        synth_n = max(1, min(current.shape[0] // 2, current.shape[0]))
+                        synth_next, synth_action = make_synthetic_camera_batch(
+                            current[:synth_n], synthetic_strength
+                        )
+                        z_synth = model.encode(current[:synth_n])
+                        synth_z_pred = model.step(z_synth, synth_action)
+                        synth_z_target = model.encode(synth_next).detach()
+                        rloss = rloss + mse(synth_z_pred, synth_z_target) * 0.5
 
-                (rloss / accum_steps).backward()
+                scaler.scale(rloss / accum_steps).backward()
 
                 if (ri + 1) % accum_steps == 0 or (ri + 1) == len(loader):
+                    scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    opt.step()
+                    scaler.step(opt)
+                    scaler.update()
                     opt.zero_grad(set_to_none=True)
 
                 rollout_loss += float(rloss.item())

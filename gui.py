@@ -18,15 +18,18 @@ class WorldModelGUI(tk.Tk):
 
         self.project_var = tk.StringVar(value=str(Path.cwd() / "my_world"))
         self.video_var = tk.StringVar()
-        self.size_var = tk.IntVar(value=128)
+        self.size_var = tk.IntVar(value=480)
         self.max_frames_var = tk.StringVar()
         self.epochs_var = tk.IntVar(value=50)
-        self.batch_size_var = tk.IntVar(value=2)
+        self.batch_size_var = tk.IntVar(value=1)
         self.lr_var = tk.StringVar(value="0.001")
-        self.latent_channels_var = tk.IntVar(value=64)
+        self.latent_channels_var = tk.IntVar(value=32)
         self.fps_var = tk.IntVar(value=30)
         self.action_strength_var = tk.StringVar(value="1.0")
         self.latent_damping_var = tk.StringVar(value="1.0")
+        self.physics_blend_var = tk.StringVar(value="0.85")
+        self.start_frame_var = tk.StringVar(value="")
+        self.accum_steps_var = tk.IntVar(value=8)
         self.synthetic_strength_var = tk.StringVar(value="0.12")
         self.device_var = tk.StringVar(value="")
 
@@ -75,25 +78,26 @@ class WorldModelGUI(tk.Tk):
         self._number_entry(train_opts, "Batch size", self.batch_size_var, 0, 1)
         self._text_entry(train_opts, "Learning rate", self.lr_var, 0, 2)
         self._number_entry(train_opts, "Latent channels", self.latent_channels_var, 0, 3)
-        self._text_entry(train_opts, "Device", self.device_var, 1, 0)
-        self._text_entry(train_opts, "Synthetic control strength", self.synthetic_strength_var, 1, 1)
+        self._number_entry(train_opts, "Accum steps", self.accum_steps_var, 1, 0)
+        self._text_entry(train_opts, "Device", self.device_var, 1, 1)
+        self._text_entry(train_opts, "Synthetic control strength", self.synthetic_strength_var, 1, 2)
 
         ttk.Button(train, text="Train world model", command=self.train_model).pack(anchor="w", pady=12)
 
         play_opts = ttk.LabelFrame(run, text="Runtime", padding=10)
         play_opts.pack(fill="x")
-        play_opts.columnconfigure(0, weight=1)
-        play_opts.columnconfigure(1, weight=1)
-        play_opts.columnconfigure(2, weight=1)
-        play_opts.columnconfigure(3, weight=1)
+        for i in range(4):
+            play_opts.columnconfigure(i, weight=1)
         self._number_entry(play_opts, "FPS", self.fps_var, 0, 0)
         self._text_entry(play_opts, "Action strength", self.action_strength_var, 0, 1)
         self._text_entry(play_opts, "Latent damping", self.latent_damping_var, 0, 2)
         self._text_entry(play_opts, "Device", self.device_var, 0, 3)
+        self._text_entry(play_opts, "Physics blend", self.physics_blend_var, 1, 0)
+        self._text_entry(play_opts, "Start frame (blank=random)", self.start_frame_var, 1, 1)
 
         ttk.Button(run, text="Play", command=self.play).pack(anchor="w", pady=12)
 
-        controls = ttk.Label(run, text="Click the pygame window first. Controls: W/S or Up/Down forward/back, A/D left/right, Left/Right rotate, Esc quits.")
+        controls = ttk.Label(run, text="Click the pygame window first. Controls: W/S or Up/Down forward/back, A/D left/right, Left/Right rotate, R reset, Esc quits.")
         controls.pack(anchor="w")
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=8)
@@ -208,12 +212,13 @@ class WorldModelGUI(tk.Tk):
                 project=self._project(),
                 epochs=int(self.epochs_var.get()),
                 batch_size=int(self.batch_size_var.get()),
-                accum_steps=4,
+                accum_steps=int(self.accum_steps_var.get()),
                 lr=float(self.lr_var.get()),
                 latent_channels=int(self.latent_channels_var.get()),
                 device=self._device(),
                 synthetic_controls=True,
                 synthetic_strength=float(self.synthetic_strength_var.get()),
+                grad_checkpoint=True,
             )
             return f"Saved checkpoint to {Path(checkpoint).resolve()}"
 
@@ -223,12 +228,17 @@ class WorldModelGUI(tk.Tk):
         def job():
             from world_model.play import play_world_model
 
+            start_raw = self.start_frame_var.get().strip()
+            start_frame = int(start_raw) if start_raw else -1
+
             play_world_model(
                 project=self._project(),
                 fps=int(self.fps_var.get()),
                 device=self._device(),
                 action_strength=float(self.action_strength_var.get()),
                 latent_damping=float(self.latent_damping_var.get()),
+                start_frame=start_frame,
+                physics_blend=float(self.physics_blend_var.get()),
             )
 
         self._run_background("Playback", job)
