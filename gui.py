@@ -10,8 +10,8 @@ class WorldModelGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AI World Model")
-        self.geometry("760x560")
-        self.minsize(680, 500)
+        self.geometry("760x600")
+        self.minsize(680, 540)
 
         self.messages: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -33,6 +33,15 @@ class WorldModelGUI(tk.Tk):
         self.synthetic_strength_var = tk.StringVar(value="0.12")
         self.device_var = tk.StringVar(value="")
 
+        # Upscaler-specific vars
+        self.up_epochs_var = tk.IntVar(value=10)
+        self.up_lr_var = tk.StringVar(value="0.0002")
+        self.up_batch_var = tk.IntVar(value=8)
+        self.up_base_ch_var = tk.IntVar(value=32)
+        self.up_n_res_var = tk.IntVar(value=4)
+        self.up_device_var = tk.StringVar(value="")
+        self.use_upscaler_var = tk.BooleanVar(value=True)
+
         self._build_ui()
         self.after(100, self._drain_messages)
 
@@ -46,13 +55,16 @@ class WorldModelGUI(tk.Tk):
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, pady=(12, 8))
 
-        setup = ttk.Frame(notebook, padding=12)
-        train = ttk.Frame(notebook, padding=12)
-        run = ttk.Frame(notebook, padding=12)
-        notebook.add(setup, text="Setup")
-        notebook.add(train, text="Train")
-        notebook.add(run, text="Play")
+        setup   = ttk.Frame(notebook, padding=12)
+        train   = ttk.Frame(notebook, padding=12)
+        run     = ttk.Frame(notebook, padding=12)
+        upscale = ttk.Frame(notebook, padding=12)
+        notebook.add(setup,   text="Setup")
+        notebook.add(train,   text="Train")
+        notebook.add(run,     text="Play")
+        notebook.add(upscale, text="Upscaler")
 
+        # ── Setup tab ─────────────────────────────────────────────────────────
         self._path_row(setup, "Project folder", self.project_var, self._choose_project).grid(row=0, column=0, sticky="ew", pady=4)
         self._path_row(setup, "Video file", self.video_var, self._choose_video).grid(row=1, column=0, sticky="ew", pady=4)
         setup.columnconfigure(0, weight=1)
@@ -70,6 +82,7 @@ class WorldModelGUI(tk.Tk):
         ttk.Button(buttons, text="Create folders", command=self.create_folders).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Preprocess video", command=self.preprocess).pack(side="left")
 
+        # ── Train tab ─────────────────────────────────────────────────────────
         train_opts = ttk.LabelFrame(train, text="Training", padding=10)
         train_opts.pack(fill="x")
         for i in range(4):
@@ -84,6 +97,7 @@ class WorldModelGUI(tk.Tk):
 
         ttk.Button(train, text="Train world model", command=self.train_model).pack(anchor="w", pady=12)
 
+        # ── Play tab ──────────────────────────────────────────────────────────
         play_opts = ttk.LabelFrame(run, text="Runtime", padding=10)
         play_opts.pack(fill="x")
         for i in range(4):
@@ -95,15 +109,57 @@ class WorldModelGUI(tk.Tk):
         self._text_entry(play_opts, "Physics blend", self.physics_blend_var, 1, 0)
         self._text_entry(play_opts, "Start frame (blank=random)", self.start_frame_var, 1, 1)
 
+        up_chk = ttk.Checkbutton(
+            run,
+            text="Use upscaler on idle (enhances frames when no keys pressed)",
+            variable=self.use_upscaler_var,
+        )
+        up_chk.pack(anchor="w", pady=(8, 0))
+
         ttk.Button(run, text="Play", command=self.play).pack(anchor="w", pady=12)
 
         controls = ttk.Label(run, text="Click the pygame window first. Controls: W/S or Up/Down forward/back, A/D left/right, Left/Right rotate, R reset, Esc quits.")
         controls.pack(anchor="w")
 
+        # ── Upscaler tab ──────────────────────────────────────────────────────
+        up_info = ttk.Label(
+            upscale,
+            text=(
+                "Train a tiny super-resolution model on the video frames.\n"
+                "Takes only minutes. During Play, idle ticks use it to sharpen frames."
+            ),
+            wraplength=640,
+            justify="left",
+        )
+        up_info.pack(anchor="w", pady=(0, 10))
+
+        up_opts = ttk.LabelFrame(upscale, text="Training options", padding=10)
+        up_opts.pack(fill="x")
+        for i in range(4):
+            up_opts.columnconfigure(i, weight=1)
+
+        self._number_entry(up_opts, "Epochs",          self.up_epochs_var,  0, 0)
+        self._text_entry  (up_opts, "Learning rate",   self.up_lr_var,      0, 1)
+        self._number_entry(up_opts, "Batch size",      self.up_batch_var,   0, 2)
+        self._text_entry  (up_opts, "Device",          self.up_device_var,  0, 3)
+        self._number_entry(up_opts, "Base channels",   self.up_base_ch_var, 1, 0)
+        self._number_entry(up_opts, "Residual blocks", self.up_n_res_var,   1, 1)
+
+        btn_frame = ttk.Frame(upscale)
+        btn_frame.pack(anchor="w", pady=12)
+        ttk.Button(btn_frame, text="Train upscaler", command=self.train_upscaler).pack(side="left", padx=(0, 8))
+
+        self._up_status = ttk.Label(upscale, text="", foreground="gray")
+        self._up_status.pack(anchor="w")
+        self._refresh_upscaler_status()
+
+        # ── Log ───────────────────────────────────────────────────────────────
         log_frame = ttk.LabelFrame(root, text="Log", padding=8)
         log_frame.pack(fill="both", expand=False)
         self.log = tk.Text(log_frame, height=9, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _path_row(self, parent, label: str, variable: tk.StringVar, command):
         frame = ttk.Frame(parent)
@@ -143,9 +199,31 @@ class WorldModelGUI(tk.Tk):
         value = self.device_var.get().strip()
         return value or None
 
+    def _up_device(self) -> str | None:
+        value = self.up_device_var.get().strip()
+        return value or None
+
     def _max_frames(self) -> int | None:
         value = self.max_frames_var.get().strip()
         return int(value) if value else None
+
+    def _refresh_upscaler_status(self) -> None:
+        try:
+            from world_model.config import ProjectPaths
+            paths = ProjectPaths(self._project())
+            if paths.upscaler_file.exists():
+                self._up_status.config(
+                    text=f"✓ Checkpoint found: {paths.upscaler_file}",
+                    foreground="green",
+                )
+            else:
+                self._up_status.config(
+                    text="No upscaler checkpoint yet — train one above.",
+                    foreground="gray",
+                )
+        except Exception:
+            self._up_status.config(text="", foreground="gray")
+        self.after(3000, self._refresh_upscaler_status)
 
     def _run_background(self, name: str, fn) -> None:
         if self.worker and self.worker.is_alive():
@@ -179,6 +257,8 @@ class WorldModelGUI(tk.Tk):
         self.log.insert("end", message + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    # ── actions ───────────────────────────────────────────────────────────────
 
     def create_folders(self) -> None:
         try:
@@ -224,6 +304,24 @@ class WorldModelGUI(tk.Tk):
 
         self._run_background("Training", job)
 
+    def train_upscaler(self) -> None:
+        def job():
+            from world_model.upscaler import train_upscaler
+
+            ckpt = train_upscaler(
+                project=self._project(),
+                epochs=int(self.up_epochs_var.get()),
+                batch_size=int(self.up_batch_var.get()),
+                lr=float(self.up_lr_var.get()),
+                base_ch=int(self.up_base_ch_var.get()),
+                n_res=int(self.up_n_res_var.get()),
+                device=self._up_device(),
+                log_fn=self.messages.put,
+            )
+            return f"Upscaler saved → {Path(ckpt).resolve()}"
+
+        self._run_background("Upscaler training", job)
+
     def play(self) -> None:
         def job():
             from world_model.play import play_world_model
@@ -239,6 +337,7 @@ class WorldModelGUI(tk.Tk):
                 latent_damping=float(self.latent_damping_var.get()),
                 start_frame=start_frame,
                 physics_blend=float(self.physics_blend_var.get()),
+                use_upscaler=bool(self.use_upscaler_var.get()),
             )
 
         self._run_background("Playback", job)

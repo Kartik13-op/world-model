@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from .config import ProjectPaths
 from .model import WorldModel
+from .upscaler import load_upscaler
 
 
 def _keys_to_action(keys) -> tuple[torch.Tensor, np.ndarray]:
@@ -101,6 +102,7 @@ def play_world_model(
     start_frame: int = -1,
     physics_blend: float = 0.92,
     normalize_latent: bool = True,
+    use_upscaler: bool = True,
 ) -> None:
     paths = ProjectPaths(Path(project))
     if not paths.model_file.exists():
@@ -113,6 +115,13 @@ def play_world_model(
     model = WorldModel(latent_channels=int(ckpt["latent_channels"])).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
+
+    # Load optional upscaler (does not affect world model weights)
+    upscaler = load_upscaler(project, device) if use_upscaler else None
+    if upscaler is not None:
+        print("[upscaler] SR model loaded — will enhance idle frames.")
+    else:
+        print("[upscaler] No checkpoint found — using bicubic fallback.")
 
     frames = np.load(paths.frames_file)
     current_frame, z, running_mean, running_std = _init_from_frame(frames, start_frame, model, device)
@@ -172,8 +181,14 @@ def play_world_model(
 
             tick += 1
 
-            # Continuous Real-time Bicubic Upscaling (2x Spatial Upsampling)
-            upscaled_frame = F.interpolate(current_frame, scale_factor=2.0, mode="bicubic", align_corners=False).clamp(0, 1)
+            # Upscale: use SR model on idle, fast bicubic when moving
+            if is_idle and upscaler is not None:
+                upscaled_frame = upscaler(current_frame).clamp(0, 1)
+            else:
+                upscaled_frame = F.interpolate(
+                    current_frame, scale_factor=2.0,
+                    mode="bicubic", align_corners=False,
+                ).clamp(0, 1)
 
             frame_np = upscaled_frame[0].permute(1, 2, 0).cpu().numpy()
             frame_np = (frame_np * 255).astype(np.uint8)

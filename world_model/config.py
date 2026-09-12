@@ -35,6 +35,10 @@ class ProjectPaths:
         return self.checkpoints_dir / "world_model.pt"
 
     @property
+    def upscaler_file(self) -> Path:
+        return self.checkpoints_dir / "upscaler.pt"
+
+    @property
     def meta_file(self) -> Path:
         return self.processed_dir / "meta.json"
 
