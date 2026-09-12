@@ -4,3 +4,4 @@ __pycache__/
 demo_world/
 */data/processed/
 */checkpoints/
+*.mp4

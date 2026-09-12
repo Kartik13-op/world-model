@@ -1,13 +1,31 @@
 """
-Lightweight 2× super-resolution upscaler.
+Ultra-lightweight 2× super-resolution upscaler for AI World Model.
 
-Architecture: Residual encoder → pixel-shuffle 2× head.
-Tiny parameter count → trains in minutes on CPU, seconds on GPU.
+Architecture:
+    LR
+      ↓
+    Bilinear 2× baseline
+      ↓
+    Tiny residual CNN
+      ↓
+    learned detail correction
+      ↓
+    HR
+
+Designed for:
+    - extremely fast training
+    - low VRAM usage
+    - CPU/GPU friendly operation
+    - concurrent training with a world model
+    - preserving meaningful structures when the world model
+      starts producing blurry / colour-glob outputs
+
+The network learns the HIGH-FREQUENCY CORRECTION rather than
+reconstructing the entire image from scratch.
 """
 
-from __future__ import annotations
-
 import gc
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,194 +37,781 @@ from torch.utils.data import DataLoader, Dataset
 from .config import ProjectPaths
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Performance configuration
+# ============================================================================
+
+if torch.cuda.is_available():
+    # Enable TensorFloat-32 on supported NVIDIA GPUs.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # Let cuDNN select the fastest convolution algorithms.
+    torch.backends.cudnn.benchmark = True
+
+
+# ============================================================================
+# Tiny residual block
+# ============================================================================
 
 class _ResBlock(nn.Module):
+    """
+    Extremely small residual block.
+
+    Compared with the original version:
+        4 blocks → 2 blocks by default
+
+    This is intentional. The upscaler is a helper network, not
+    the primary world model.
+    """
+
     def __init__(self, ch: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(ch, ch, 3, padding=1),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(ch, ch, 3, padding=1),
+
+        self.conv1 = nn.Conv2d(
+            ch,
+            ch,
+            kernel_size=3,
+            padding=1,
+        )
+
+        self.act = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            ch,
+            ch,
+            kernel_size=3,
+            padding=1,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
+        return x + self.conv2(self.act(self.conv1(x)))
 
+
+# ============================================================================
+# Upscaler
+# ============================================================================
 
 class UpscalerNet(nn.Module):
     """
-    Takes [B, 3, H, W] in [0,1] → outputs [B, 3, 2H, 2W] in [0,1].
-    Very small: ~300 K params. Trains fast.
+    Lightweight 2× residual super-resolution network.
+
+    Input:
+        [B, 3, H, W]
+
+    Output:
+        [B, 3, 2H, 2W]
+
+    The network does NOT reconstruct the entire HR image.
+
+    Instead:
+
+        bilinear(LR) + learned_detail
+
+    This makes learning considerably easier and faster.
     """
 
-    def __init__(self, base_ch: int = 32, n_res: int = 4) -> None:
+    def __init__(
+        self,
+        base_ch: int = 24,
+        n_res: int = 2,
+    ) -> None:
+
         super().__init__()
-        self.head = nn.Conv2d(3, base_ch, 3, padding=1)
-        self.body = nn.Sequential(*[_ResBlock(base_ch) for _ in range(n_res)])
-        # Pixel-shuffle: output base_ch*4 channels → shuffle → base_ch channels
-        self.upsample = nn.Sequential(
-            nn.Conv2d(base_ch, base_ch * 4, 3, padding=1),
-            nn.PixelShuffle(2),          # → base_ch channels at 2× resolution
-            nn.LeakyReLU(0.1, inplace=True),
+
+        # Feature extraction
+        self.head = nn.Conv2d(
+            3,
+            base_ch,
+            kernel_size=3,
+            padding=1,
         )
-        self.tail = nn.Conv2d(base_ch, 3, 3, padding=1)
+
+        # Tiny residual body
+        self.body = nn.Sequential(
+            *[
+                _ResBlock(base_ch)
+                for _ in range(n_res)
+            ]
+        )
+
+        # 2× pixel shuffle
+        self.up = nn.Sequential(
+            nn.Conv2d(
+                base_ch,
+                base_ch * 4,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.PixelShuffle(2),
+            nn.ReLU(inplace=True),
+        )
+
+        # Predict RGB residual/detail
+        self.tail = nn.Conv2d(
+            base_ch,
+            3,
+            kernel_size=3,
+            padding=1,
+        )
+
+        # Start with almost-zero correction.
+        #
+        # This means the freshly initialized network behaves
+        # approximately like a normal bilinear upscaler.
+        nn.init.zeros_(self.tail.weight)
+        nn.init.zeros_(self.tail.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = F.leaky_relu(self.head(x), 0.1, inplace=False)
+
+        # Cheap baseline.
+        baseline = F.interpolate(
+            x,
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # Learn only the missing information.
+        feat = F.relu(
+            self.head(x),
+            inplace=True,
+        )
+
         feat = self.body(feat)
-        feat = self.upsample(feat)
-        out = torch.sigmoid(self.tail(feat))
-        return out
+        feat = self.up(feat)
+
+        residual = self.tail(feat)
+
+        # Residual correction.
+        out = baseline + residual
+
+        # Keep output valid.
+        return out.clamp_(0.0, 1.0)
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Dataset
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 class _HRLRDataset(Dataset):
     """
-    Loads full-res frames from frames.npy.
-    Returns (lr_frame, hr_frame) pairs; LR is generated on-the-fly by
-    downsampling 2× with bilinear, giving the model a clean target.
+    Dataset for super-resolution training.
+
+    The important optimization here is:
+
+        LR images are generated ONCE.
+
+    The original implementation generated LR images inside
+    __getitem__, which means interpolation was repeatedly performed
+    throughout training.
     """
 
-    def __init__(self, frames_file: Path) -> None:
-        frames = np.load(frames_file)              # [N, H, W, 3]  uint8
-        self.hr = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0
+    def __init__(
+        self,
+        frames_file: Path,
+    ) -> None:
+
+        frames = np.load(
+            frames_file,
+            mmap_mode="r",
+        )
+
+        # Convert the complete dataset once.
+        #
+        # If frames.npy is reasonably sized, this is considerably
+        # faster than repeatedly converting individual frames.
+        hr = torch.from_numpy(
+            np.asarray(frames)
+        ).permute(
+            0,
+            3,
+            1,
+            2,
+        ).float()
+
+        hr.div_(255.0)
+
+        self.hr = hr.contiguous()
+
+        # Precompute LR dataset ONCE.
+        #
+        # This removes interpolation from the training loop.
+        with torch.no_grad():
+
+            self.lr = F.interpolate(
+                self.hr,
+                scale_factor=0.5,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        self.lr = self.lr.contiguous()
 
     def __len__(self) -> int:
-        return len(self.hr)
+        return self.hr.shape[0]
 
     def __getitem__(self, idx: int):
-        hr = self.hr[idx]                          # [3, H, W]
-        lr = F.interpolate(
-            hr.unsqueeze(0), scale_factor=0.5,
-            mode="bilinear", align_corners=False,
-        ).squeeze(0)                               # [3, H/2, W/2]
-        return lr, hr
+
+        return (
+            self.lr[idx],
+            self.hr[idx],
+        )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Optional patch dataset
+# ============================================================================
+
+class _PatchDataset(Dataset):
+    """
+    Random-crop wrapper around the HR/LR dataset.
+
+    This is MUCH faster when your frames are large.
+
+    Example:
+
+        HR: 256×256
+        LR: 128×128
+
+    with patch_size=64:
+
+        LR patch: 64×64
+        HR patch: 128×128
+
+    The model processes only 1/4 of the LR pixels instead of
+    the entire frame.
+    """
+
+    def __init__(
+        self,
+        base: _HRLRDataset,
+        patch_size: int = 64,
+    ) -> None:
+
+        self.base = base
+        self.patch_size = patch_size
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+
+        lr, hr = self.base[idx]
+
+        _, h, w = lr.shape
+
+        ps = min(
+            self.patch_size,
+            h,
+            w,
+        )
+
+        if h == ps:
+            y = 0
+        else:
+            y = torch.randint(
+                0,
+                h - ps + 1,
+                (),
+            ).item()
+
+        if w == ps:
+            x = 0
+        else:
+            x = torch.randint(
+                0,
+                w - ps + 1,
+                (),
+            ).item()
+
+        lr_patch = lr[
+            :,
+            y:y + ps,
+            x:x + ps,
+        ]
+
+        # HR coordinates are exactly 2×.
+        hy = y * 2
+        hx = x * 2
+        hps = ps * 2
+
+        hr_patch = hr[
+            :,
+            hy:hy + hps,
+            hx:hx + hps,
+        ]
+
+        return lr_patch, hr_patch
+
+
+# ============================================================================
+# Loss
+# ============================================================================
+
+def fast_sr_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    edge_loss: bool = False,
+) -> torch.Tensor:
+    """
+    Fast reconstruction loss.
+
+    Default:
+        L1 only.
+
+    Optional:
+        lightweight gradient/edge loss.
+
+    Edge loss should NOT necessarily run on every batch.
+    """
+
+    loss = F.l1_loss(
+        pred,
+        target,
+    )
+
+    if edge_loss:
+
+        pred_x = pred[..., :, 1:] - pred[..., :, :-1]
+        target_x = target[..., :, 1:] - target[..., :, :-1]
+
+        pred_y = pred[..., 1:, :] - pred[..., :-1, :]
+        target_y = target[..., 1:, :] - target[..., :-1, :]
+
+        loss += 0.25 * (
+            F.l1_loss(pred_x, target_x)
+            + F.l1_loss(pred_y, target_y)
+        )
+
+    return loss
+
+
+# ============================================================================
 # Training
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def train_upscaler(
     project: str | Path,
     epochs: int = 10,
-    batch_size: int = 8,
-    lr: float = 2e-4,
-    base_ch: int = 32,
-    n_res: int = 4,
+    batch_size: int = 16,
+    lr: float = 3e-4,
+    base_ch: int = 24,
+    n_res: int = 2,
+    patch_size: int | None = 64,
     device: str | None = None,
     log_fn=None,
+    compile_model: bool = False,
+    edge_loss_every: int = 8,
 ) -> Path:
-    """
-    Train UpscalerNet on the preprocessed frames and save checkpoint.
 
-    Returns the path to the saved checkpoint.
-    """
     paths = ProjectPaths(Path(project))
+
     if not paths.frames_file.exists():
-        raise RuntimeError("Run preprocess first — frames.npy not found.")
+        raise RuntimeError(
+            "Run preprocess first — frames.npy not found."
+        )
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    # ------------------------------------------------------------------------
+    # Device
+    # ------------------------------------------------------------------------
 
-    if "cpu" in device.lower():
-        torch.set_num_threads(4)
+    device = device or (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    is_cuda = device.startswith("cuda")
+    is_cpu = not is_cuda
+
+    if is_cpu:
+
+        # Keep the world-model machine responsive.
+        torch.set_num_threads(2)
         torch.set_num_interop_threads(1)
 
+    # ------------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------------
+
     def _log(msg: str) -> None:
+
+        print(
+            msg,
+            flush=True,
+        )
+
         if log_fn:
             log_fn(msg)
-        else:
-            print(msg)
 
-    dataset = _HRLRDataset(paths.frames_file)
+    # ------------------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------------------
+
+    _log("Loading super-resolution dataset...")
+
+    base_dataset = _HRLRDataset(
+        paths.frames_file
+    )
+
+    if patch_size is not None:
+
+        dataset = _PatchDataset(
+            base_dataset,
+            patch_size=patch_size,
+        )
+
+        _log(
+            f"Using random {patch_size}×{patch_size} LR patches"
+        )
+
+    else:
+
+        dataset = base_dataset
+
+        _log("Using full-frame training")
+
+    # ------------------------------------------------------------------------
+    # DataLoader
+    # ------------------------------------------------------------------------
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=False,
         num_workers=0,
-        pin_memory=False,
+        pin_memory=is_cuda,
     )
 
-    model = UpscalerNet(base_ch=base_ch, n_res=n_res).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    # ------------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------------
+
+    model = UpscalerNet(
+        base_ch=base_ch,
+        n_res=n_res,
+    ).to(device)
+
+    # Channels-last can improve NVIDIA convolution performance.
+    if is_cuda:
+
+        model = model.to(
+            memory_format=torch.channels_last
+        )
+
+    # ------------------------------------------------------------------------
+    # Optional torch.compile
+    # ------------------------------------------------------------------------
+
+    if compile_model and hasattr(
+        torch,
+        "compile",
+    ):
+
+        _log("Compiling upscaler...")
+
+        model = torch.compile(
+            model,
+            mode="reduce-overhead",
+        )
+
+    # ------------------------------------------------------------------------
+    # Optimizer
+    # ------------------------------------------------------------------------
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=1e-5,
+    )
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=epochs, eta_min=lr * 0.05
+        optimizer,
+        T_max=epochs,
+        eta_min=lr * 0.05,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=("cuda" in device))
 
-    n_params = sum(p.numel() for p in model.parameters())
-    _log(f"UpscalerNet: {n_params/1e3:.1f} K params | device={device}")
+    # ------------------------------------------------------------------------
+    # AMP
+    # ------------------------------------------------------------------------
 
-    for epoch in range(1, epochs + 1):
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=is_cuda,
+    )
+
+    # ------------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------------
+
+    n_params = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    _log(
+        f"UpscalerNet: {n_params / 1e3:.1f} K params "
+        f"| device={device}"
+    )
+
+    _log(
+        f"Dataset: {len(dataset)} samples"
+    )
+
+    total_batches = len(loader)
+
+    # ------------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------------
+
+    global_step = 0
+
+    for epoch in range(
+        1,
+        epochs + 1,
+    ):
+
         model.train()
+
         total_loss = 0.0
         n_batches = 0
 
+        start_time = time.perf_counter()
+
         for lr_batch, hr_batch in loader:
-            lr_batch = lr_batch.to(device, non_blocking=True)
-            hr_batch = hr_batch.to(device, non_blocking=True)
+
+            global_step += 1
+
+            # --------------------------------------------------------------
+            # Transfer
+            # --------------------------------------------------------------
+
+            if is_cuda:
+
+                lr_batch = lr_batch.to(
+                    device,
+                    non_blocking=True,
+                )
+
+                hr_batch = hr_batch.to(
+                    device,
+                    non_blocking=True,
+                )
+
+                lr_batch = lr_batch.contiguous(
+                    memory_format=torch.channels_last
+                )
+
+                hr_batch = hr_batch.contiguous(
+                    memory_format=torch.channels_last
+                )
+
+            else:
+
+                lr_batch = lr_batch.to(device)
+                hr_batch = hr_batch.to(device)
+
+            # --------------------------------------------------------------
+            # Edge loss only occasionally
+            # --------------------------------------------------------------
+
+            use_edge_loss = (
+                edge_loss_every > 0
+                and global_step % edge_loss_every == 0
+            )
+
+            # --------------------------------------------------------------
+            # Forward
+            # --------------------------------------------------------------
 
             with torch.autocast(
-                device_type=device.split(":")[0],
-                enabled=("cuda" in device),
+                device_type="cuda",
+                enabled=is_cuda,
             ):
-                pred = model(lr_batch)
-                # L1 pixel loss + gradient loss (keeps edges sharp)
-                loss_pixel = F.l1_loss(pred, hr_batch)
-                gx_pred = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-                gx_hr   = hr_batch[:, :, :, 1:] - hr_batch[:, :, :, :-1]
-                gy_pred = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-                gy_hr   = hr_batch[:, :, 1:, :] - hr_batch[:, :, :-1, :]
-                loss_grad = F.l1_loss(gx_pred, gx_hr) + F.l1_loss(gy_pred, gy_hr)
-                loss = loss_pixel + 0.5 * loss_grad
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
+                pred = model(
+                    lr_batch
+                )
+
+                loss = fast_sr_loss(
+                    pred,
+                    hr_batch,
+                    edge_loss=use_edge_loss,
+                )
+
+            # --------------------------------------------------------------
+            # Backward
+            # --------------------------------------------------------------
+
+            scaler.scale(
+                loss
+            ).backward()
+
+            scaler.unscale_(
+                optimizer
+            )
+
+            nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0,
+            )
+
+            scaler.step(
+                optimizer
+            )
+
             scaler.update()
-            opt.zero_grad(set_to_none=True)
 
-            total_loss += float(loss.item())
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            # --------------------------------------------------------------
+            # CPU breathing room
+            # --------------------------------------------------------------
+
+            if is_cpu:
+
+                time.sleep(
+                    0.005
+                )
+
+            # --------------------------------------------------------------
+            # Logging
+            # --------------------------------------------------------------
+
+            loss_value = float(
+                loss.detach().item()
+            )
+
+            total_loss += loss_value
             n_batches += 1
 
+            if (
+                n_batches % 20 == 0
+                or n_batches == total_batches
+            ):
+
+                elapsed = (
+                    time.perf_counter()
+                    - start_time
+                )
+
+                batches_per_sec = (
+                    n_batches
+                    / max(elapsed, 1e-6)
+                )
+
+                _log(
+                    f"  [epoch {epoch}/{epochs}] "
+                    f"batch {n_batches}/{total_batches} "
+                    f"loss={loss_value:.4f} "
+                    f"{batches_per_sec:.2f} batch/s"
+                )
+
+        # --------------------------------------------------------------------
+        # Epoch end
+        # --------------------------------------------------------------------
+
         scheduler.step()
-        avg = total_loss / max(1, n_batches)
-        _log(f"Upscaler epoch {epoch}/{epochs}: loss={avg:.4f}")
+
+        avg_loss = (
+            total_loss
+            / max(
+                1,
+                n_batches,
+            )
+        )
+
+        epoch_time = (
+            time.perf_counter()
+            - start_time
+        )
+
+        _log(
+            f"Upscaler epoch "
+            f"{epoch}/{epochs}: "
+            f"loss={avg_loss:.4f} "
+            f"time={epoch_time:.1f}s"
+        )
 
         gc.collect()
-        if "cuda" in device:
+
+        if is_cuda:
+
             torch.cuda.empty_cache()
 
+    # ------------------------------------------------------------------------
     # Save
-    paths.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    # ------------------------------------------------------------------------
+
+    paths.checkpoints_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     ckpt_data = {
         "model": model.state_dict(),
         "base_ch": base_ch,
         "n_res": n_res,
     }
-    torch.save(ckpt_data, paths.upscaler_file)
-    _log(f"Upscaler saved → {paths.upscaler_file}")
+
+    torch.save(
+        ckpt_data,
+        paths.upscaler_file,
+    )
+
+    _log(
+        f"Upscaler saved → "
+        f"{paths.upscaler_file}"
+    )
+
     return paths.upscaler_file
 
 
-def load_upscaler(project: str | Path, device: str) -> UpscalerNet | None:
-    """Load upscaler checkpoint if it exists, else return None."""
-    paths = ProjectPaths(Path(project))
+# ============================================================================
+# Loading
+# ============================================================================
+
+def load_upscaler(
+    project: str | Path,
+    device: str,
+) -> UpscalerNet | None:
+
+    paths = ProjectPaths(
+        Path(project)
+    )
+
     if not paths.upscaler_file.exists():
         return None
-    ckpt = torch.load(paths.upscaler_file, map_location=device, weights_only=True)
+
+    checkpoint = torch.load(
+        paths.upscaler_file,
+        map_location=device,
+        weights_only=True,
+    )
+
     model = UpscalerNet(
-        base_ch=int(ckpt.get("base_ch", 32)),
-        n_res=int(ckpt.get("n_res", 4)),
+        base_ch=int(
+            checkpoint.get(
+                "base_ch",
+                24,
+            )
+        ),
+        n_res=int(
+            checkpoint.get(
+                "n_res",
+                2,
+            )
+        ),
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+
+    model.load_state_dict(
+        checkpoint["model"]
+    )
+
     model.eval()
+
     return model
