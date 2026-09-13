@@ -29,6 +29,24 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--no-synthetic-controls", action="store_true")
     train.add_argument("--synthetic-strength", type=float, default=0.12)
 
+    recon = sub.add_parser("reconstructor", help="Train or resume the display-side reconstructor only.")
+    recon.add_argument("--project", required=True)
+    recon.add_argument("--epochs", type=int, default=6, help="Additional epochs to run.")
+    recon.add_argument("--batch-size", type=int, default=8, help="Batch size for fast complete-frame training.")
+    recon.add_argument("--lr", type=float, default=3e-4)
+    recon.add_argument("--base-ch", type=int, default=32)
+    recon.add_argument("--n-res", type=int, default=4)
+    recon.add_argument("--patch-size", type=int, default=0, help="Random patch size; 0 trains on complete frames.")
+    recon.add_argument("--train-size", type=int, default=256, help="Training long-side cap; 0 keeps original resolution.")
+    recon.add_argument("--max-samples", type=int, default=512, help="Frames sampled per epoch; 0 uses every frame.")
+    recon.add_argument("--device", default=None)
+    recon.add_argument("--resume", action="store_true", help="Continue from reconstructor.pt.")
+    recon.add_argument("--compile", action="store_true", help="Use torch.compile when available.")
+
+    verify = sub.add_parser("verify", help="Read-only verification of data and model pipeline.")
+    verify.add_argument("--project", required=True)
+    verify.add_argument("--device", default="cpu")
+
     play = sub.add_parser("play", help="Play the trained world model.")
     play.add_argument("--project", required=True)
     play.add_argument("--fps", type=int, default=30)
@@ -75,6 +93,29 @@ def main() -> None:
             synthetic_strength=args.synthetic_strength,
         )
         print(f"Saved checkpoint to {Path(ckpt).resolve()}")
+    elif args.command == "reconstructor":
+        from world_model.reconstructor import train_reconstructor
+
+        ckpt = train_reconstructor(
+            project=args.project,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            base_ch=args.base_ch,
+            n_res=args.n_res,
+            patch_size=args.patch_size or None,
+            train_size=args.train_size or None,
+            max_samples=args.max_samples or None,
+            device=args.device,
+            compile_model=args.compile,
+            resume=args.resume,
+        )
+        print(f"Saved reconstructor checkpoint to {Path(ckpt).resolve()}")
+    elif args.command == "verify":
+        from world_model.verify import verify_pipeline
+
+        for message in verify_pipeline(args.project, device=args.device):
+            print(f"[verify] {message}")
     elif args.command == "play":
         from world_model.play import play_world_model
 

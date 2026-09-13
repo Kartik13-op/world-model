@@ -1,5 +1,8 @@
 import queue
+import re
+import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -10,11 +13,17 @@ class WorldModelGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AI World Model")
-        self.geometry("760x600")
-        self.minsize(680, 540)
+        self.geometry("940x760")
+        self.minsize(780, 620)
 
         self.messages: queue.Queue[str] = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.job_started_at: float | None = None
+        self.job_name_var = tk.StringVar(value="Ready")
+        self.job_detail_var = tk.StringVar(value="Choose a project and run verification.")
+        self.elapsed_var = tk.StringVar(value="Elapsed: 00:00")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.pipeline_status_var = tk.StringVar(value="Checking pipeline…")
 
         self.project_var = tk.StringVar(value=str(Path.cwd() / "my_world"))
         self.video_var = tk.StringVar()
@@ -32,17 +41,26 @@ class WorldModelGUI(tk.Tk):
         self.accum_steps_var = tk.IntVar(value=8)
         self.synthetic_strength_var = tk.StringVar(value="0.12")
         self.device_var = tk.StringVar(value="")
+        self.save_every_var = tk.IntVar(value=10)
+        self.synthetic_controls_var = tk.BooleanVar(value=True)
 
-        # Upscaler-specific vars
-        self.up_epochs_var = tk.IntVar(value=10)
-        self.up_lr_var = tk.StringVar(value="0.0002")
+        # Display-side reconstructor vars
+        self.up_epochs_var = tk.IntVar(value=6)
+        self.up_lr_var = tk.StringVar(value="0.0003")
         self.up_batch_var = tk.IntVar(value=8)
         self.up_base_ch_var = tk.IntVar(value=32)
         self.up_n_res_var = tk.IntVar(value=4)
         self.up_device_var = tk.StringVar(value="")
-        self.use_upscaler_var = tk.BooleanVar(value=True)
+        self.up_resume_var = tk.BooleanVar(value=True)
+        self.up_patch_size_var = tk.IntVar(value=0)
+        self.up_train_size_var = tk.IntVar(value=256)
+        self.up_max_samples_var = tk.IntVar(value=512)
+        self.up_edge_every_var = tk.IntVar(value=8)
+        self.up_compile_var = tk.BooleanVar(value=False)
+        self.use_reconstructor_var = tk.BooleanVar(value=True)
 
         self._build_ui()
+        self._refresh_pipeline_status()
         self.after(100, self._drain_messages)
 
     def _build_ui(self) -> None:
@@ -52,17 +70,43 @@ class WorldModelGUI(tk.Tk):
         title = ttk.Label(root, text="AI World Model", font=("Segoe UI", 18, "bold"))
         title.pack(anchor="w")
 
+        status = ttk.Frame(root)
+        status.pack(fill="x", pady=(6, 4))
+        status.columnconfigure(1, weight=1)
+        ttk.Label(status, textvariable=self.job_name_var).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.progress = ttk.Progressbar(status, variable=self.progress_var, maximum=100, mode="determinate")
+        self.progress.grid(row=0, column=1, sticky="ew")
+        ttk.Label(status, textvariable=self.elapsed_var, width=16).grid(row=0, column=2, sticky="e", padx=(10, 0))
+        ttk.Label(root, textvariable=self.job_detail_var, foreground="gray").pack(anchor="w")
+
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, pady=(12, 8))
 
+        dashboard = ttk.Frame(notebook, padding=12)
         setup   = ttk.Frame(notebook, padding=12)
         train   = ttk.Frame(notebook, padding=12)
         run     = ttk.Frame(notebook, padding=12)
         upscale = ttk.Frame(notebook, padding=12)
+        notebook.add(dashboard, text="Dashboard")
         notebook.add(setup,   text="Setup")
         notebook.add(train,   text="Train")
         notebook.add(run,     text="Play")
-        notebook.add(upscale, text="Upscaler")
+        notebook.add(upscale, text="Reconstructor")
+
+        # ── Dashboard tab ────────────────────────────────────────────────────
+        dash_title = ttk.Label(dashboard, text="Pipeline overview", font=("Segoe UI", 13, "bold"))
+        dash_title.pack(anchor="w")
+        ttk.Label(dashboard, textvariable=self.pipeline_status_var, wraplength=760, justify="left").pack(anchor="w", pady=(4, 12))
+        self.pipeline_tree = ttk.Treeview(dashboard, columns=("state", "artifact"), show="headings", height=6)
+        self.pipeline_tree.heading("state", text="Stage")
+        self.pipeline_tree.heading("artifact", text="Status / artifact")
+        self.pipeline_tree.column("state", width=180, anchor="w")
+        self.pipeline_tree.column("artifact", width=600, anchor="w")
+        self.pipeline_tree.pack(fill="x", pady=(0, 12))
+        dash_buttons = ttk.Frame(dashboard)
+        dash_buttons.pack(anchor="w")
+        ttk.Button(dash_buttons, text="Verify pipeline", command=self.verify_pipeline).pack(side="left", padx=(0, 8))
+        ttk.Button(dash_buttons, text="Refresh status", command=self._refresh_pipeline_status).pack(side="left")
 
         # ── Setup tab ─────────────────────────────────────────────────────────
         self._path_row(setup, "Project folder", self.project_var, self._choose_project).grid(row=0, column=0, sticky="ew", pady=4)
@@ -94,6 +138,8 @@ class WorldModelGUI(tk.Tk):
         self._number_entry(train_opts, "Accum steps", self.accum_steps_var, 1, 0)
         self._text_entry(train_opts, "Device", self.device_var, 1, 1)
         self._text_entry(train_opts, "Synthetic control strength", self.synthetic_strength_var, 1, 2)
+        self._number_entry(train_opts, "Save every N epochs", self.save_every_var, 1, 3)
+        ttk.Checkbutton(train_opts, text="Synthetic controls", variable=self.synthetic_controls_var).grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=4)
 
         ttk.Button(train, text="Train world model", command=self.train_model).pack(anchor="w", pady=12)
 
@@ -111,8 +157,8 @@ class WorldModelGUI(tk.Tk):
 
         up_chk = ttk.Checkbutton(
             run,
-            text="Use upscaler on idle (enhances frames when no keys pressed)",
-            variable=self.use_upscaler_var,
+            text="Use visual reconstructor on idle (display-only restoration)",
+            variable=self.use_reconstructor_var,
         )
         up_chk.pack(anchor="w", pady=(8, 0))
 
@@ -121,12 +167,12 @@ class WorldModelGUI(tk.Tk):
         controls = ttk.Label(run, text="Click the pygame window first. Controls: W/S or Up/Down forward/back, A/D left/right, Left/Right rotate, R reset, Esc quits.")
         controls.pack(anchor="w")
 
-        # ── Upscaler tab ──────────────────────────────────────────────────────
+        # ── Reconstructor tab ─────────────────────────────────────────────────
         up_info = ttk.Label(
             upscale,
             text=(
-                "Train a tiny super-resolution model on the video frames.\n"
-                "Takes only minutes. During Play, idle ticks use it to sharpen frames."
+                "Train a separate display-side visual reconstructor on the original training video.\n"
+                "It learns a per-video visual prior and repairs degraded world-model outputs without feeding them back into the latent state."
             ),
             wraplength=640,
             justify="left",
@@ -144,14 +190,20 @@ class WorldModelGUI(tk.Tk):
         self._text_entry  (up_opts, "Device",          self.up_device_var,  0, 3)
         self._number_entry(up_opts, "Base channels",   self.up_base_ch_var, 1, 0)
         self._number_entry(up_opts, "Residual blocks", self.up_n_res_var,   1, 1)
+        ttk.Checkbutton(up_opts, text="Resume existing checkpoint", variable=self.up_resume_var).grid(row=1, column=2, columnspan=2, sticky="w", padx=4, pady=4)
+        self._number_entry(up_opts, "Patch size (0=full frame)", self.up_patch_size_var, 2, 0)
+        self._number_entry(up_opts, "Edge loss interval", self.up_edge_every_var, 2, 1)
+        ttk.Checkbutton(up_opts, text="Compile for CUDA", variable=self.up_compile_var).grid(row=2, column=2, columnspan=2, sticky="w", padx=4, pady=4)
+        self._number_entry(up_opts, "Fast train size", self.up_train_size_var, 3, 0)
+        self._number_entry(up_opts, "Frames per epoch", self.up_max_samples_var, 3, 1)
 
         btn_frame = ttk.Frame(upscale)
         btn_frame.pack(anchor="w", pady=12)
-        ttk.Button(btn_frame, text="Train upscaler", command=self.train_upscaler).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="Train reconstructor", command=self.train_reconstructor).pack(side="left", padx=(0, 8))
 
         self._up_status = ttk.Label(upscale, text="", foreground="gray")
         self._up_status.pack(anchor="w")
-        self._refresh_upscaler_status()
+        self._refresh_reconstructor_status()
 
         # ── Log ───────────────────────────────────────────────────────────────
         log_frame = ttk.LabelFrame(root, text="Log", padding=8)
@@ -207,28 +259,85 @@ class WorldModelGUI(tk.Tk):
         value = self.max_frames_var.get().strip()
         return int(value) if value else None
 
-    def _refresh_upscaler_status(self) -> None:
+    def _set_job(self, name: str, detail: str, running: bool = True) -> None:
+        self.job_name_var.set(name)
+        self.job_detail_var.set(detail)
+        if running:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+
+    def _progress_update(self, completed: int, total: int) -> None:
+        if total > 0:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self.progress_var.set(min(100.0, 100.0 * completed / total))
+            self.job_detail_var.set(f"Epoch {completed}/{total}")
+
+    def _format_elapsed(self) -> str:
+        if self.job_started_at is None:
+            return "Elapsed: 00:00"
+        seconds = int(time.monotonic() - self.job_started_at)
+        return f"Elapsed: {seconds // 60:02d}:{seconds % 60:02d}"
+
+    def _refresh_pipeline_status(self) -> None:
         try:
             from world_model.config import ProjectPaths
             paths = ProjectPaths(self._project())
-            if paths.upscaler_file.exists():
+            rows = []
+            frames_ok = paths.frames_file.exists() and paths.actions_file.exists()
+            rows.append(("Preprocess", "Ready — frames.npy and actions.npy" if frames_ok else "Missing processed data"))
+            rows.append(("World model", f"Ready — {paths.model_file}" if paths.model_file.exists() else "Not trained yet"))
+            recon = paths.reconstructor_file
+            rows.append(("Reconstructor", f"Ready — {recon}" if recon.exists() else "Optional; not trained yet"))
+            rows.append(("Playback", "Ready" if paths.model_file.exists() and frames_ok else "Needs preprocess + world training"))
+            for item in self.pipeline_tree.get_children():
+                self.pipeline_tree.delete(item)
+            for stage, detail in rows:
+                self.pipeline_tree.insert("", "end", values=(stage, detail))
+            self.pipeline_status_var.set("Pipeline status refreshed. The reconstructor is display-only and can be retrained independently.")
+        except Exception as exc:
+            self.pipeline_status_var.set(f"Cannot inspect project: {exc}")
+
+    def verify_pipeline(self) -> None:
+        def job():
+            from world_model.verify import verify_pipeline
+            messages = verify_pipeline(self._project(), device=self._device() or "cpu")
+            for message in messages:
+                self.messages.put(message)
+            return "Pipeline verification passed."
+
+        self._run_background("Pipeline verification", job, indeterminate=False)
+
+    def _refresh_reconstructor_status(self) -> None:
+        try:
+            from world_model.config import ProjectPaths
+            paths = ProjectPaths(self._project())
+            ckpt = paths.reconstructor_file
+            if ckpt.exists():
                 self._up_status.config(
-                    text=f"✓ Checkpoint found: {paths.upscaler_file}",
+                    text=f"✓ Checkpoint found: {ckpt}",
                     foreground="green",
                 )
             else:
                 self._up_status.config(
-                    text="No upscaler checkpoint yet — train one above.",
+                    text="No reconstructor checkpoint yet — train one above.",
                     foreground="gray",
                 )
         except Exception:
             self._up_status.config(text="", foreground="gray")
-        self.after(3000, self._refresh_upscaler_status)
+        self.after(3000, self._refresh_reconstructor_status)
 
-    def _run_background(self, name: str, fn) -> None:
+    def _run_background(self, name: str, fn, indeterminate: bool = True) -> None:
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Busy", "A job is already running.")
             return
+
+        self.job_started_at = time.monotonic()
+        self.progress_var.set(0.0)
+        self._set_job(name, "Working…", running=indeterminate)
 
         def wrapped():
             try:
@@ -237,8 +346,20 @@ class WorldModelGUI(tk.Tk):
                 if result is not None:
                     self.messages.put(str(result))
                 self.messages.put(f"{name} finished.")
+            except ModuleNotFoundError as exc:
+                if exc.name == "torch":
+                    self.messages.put(
+                        "PyTorch is not installed in the Python interpreter "
+                        f"running this GUI: {sys.executable}. "
+                        "Install the project dependencies with "
+                        f'"{sys.executable}" -m pip install -r requirements.txt'
+                    )
+                else:
+                    self.messages.put(f"Missing Python module: {exc.name}")
             except Exception as exc:
                 self.messages.put(f"Error: {exc}")
+            finally:
+                self.messages.put("__JOB_FINISHED__")
 
         self.worker = threading.Thread(target=wrapped, daemon=True)
         self.worker.start()
@@ -249,7 +370,18 @@ class WorldModelGUI(tk.Tk):
                 message = self.messages.get_nowait()
             except queue.Empty:
                 break
+            if message.startswith("__PROGRESS__:"):
+                _, completed, total = message.split(":", 2)
+                self._progress_update(int(completed), int(total))
+                continue
+            if message == "__JOB_FINISHED__":
+                self._set_job("Ready", "Job finished. Review the log for details.", running=False)
+                self.progress_var.set(100.0)
+                self._refresh_pipeline_status()
+                continue
             self._log(message)
+            self.job_detail_var.set(message)
+        self.elapsed_var.set(self._format_elapsed())
         self.after(100, self._drain_messages)
 
     def _log(self, message: str) -> None:
@@ -296,31 +428,40 @@ class WorldModelGUI(tk.Tk):
                 lr=float(self.lr_var.get()),
                 latent_channels=int(self.latent_channels_var.get()),
                 device=self._device(),
-                synthetic_controls=True,
+                save_every=int(self.save_every_var.get()),
+                synthetic_controls=bool(self.synthetic_controls_var.get()),
                 synthetic_strength=float(self.synthetic_strength_var.get()),
                 grad_checkpoint=True,
+                progress_fn=lambda epoch, total: self.messages.put(f"__PROGRESS__:{epoch}:{total}"),
             )
             return f"Saved checkpoint to {Path(checkpoint).resolve()}"
 
         self._run_background("Training", job)
 
-    def train_upscaler(self) -> None:
+    def train_reconstructor(self) -> None:
         def job():
-            from world_model.upscaler import train_upscaler
+            from world_model.reconstructor import train_reconstructor
 
-            ckpt = train_upscaler(
+            ckpt = train_reconstructor(
                 project=self._project(),
                 epochs=int(self.up_epochs_var.get()),
                 batch_size=int(self.up_batch_var.get()),
                 lr=float(self.up_lr_var.get()),
                 base_ch=int(self.up_base_ch_var.get()),
                 n_res=int(self.up_n_res_var.get()),
+                patch_size=(int(self.up_patch_size_var.get()) or None),
                 device=self._up_device(),
                 log_fn=self.messages.put,
+                resume=bool(self.up_resume_var.get()),
+                compile_model=bool(self.up_compile_var.get()),
+                edge_loss_every=int(self.up_edge_every_var.get()),
+                progress_fn=lambda epoch, total: self.messages.put(f"__PROGRESS__:{epoch}:{total}"),
+                train_size=(int(self.up_train_size_var.get()) or None),
+                max_samples=(int(self.up_max_samples_var.get()) or None),
             )
-            return f"Upscaler saved → {Path(ckpt).resolve()}"
+            return f"Reconstructor saved → {Path(ckpt).resolve()}"
 
-        self._run_background("Upscaler training", job)
+        self._run_background("Reconstructor training", job)
 
     def play(self) -> None:
         def job():
@@ -337,7 +478,7 @@ class WorldModelGUI(tk.Tk):
                 latent_damping=float(self.latent_damping_var.get()),
                 start_frame=start_frame,
                 physics_blend=float(self.physics_blend_var.get()),
-                use_upscaler=bool(self.use_upscaler_var.get()),
+                use_reconstructor=bool(self.use_reconstructor_var.get()),
             )
 
         self._run_background("Playback", job)

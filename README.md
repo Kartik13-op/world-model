@@ -2,11 +2,14 @@
 
 A PyTorch-based world model that learns to simulate a video from raw footage. It estimates camera motion via optical flow, trains an autoencoder and a latent-space transition U-Net, and lets you interactively steer through the learned world using keyboard controls.
 
+A separate display-side visual reconstructor learns a video-specific scene prior from the original training frames. When no key is pressed during playback, it regenerates the complete current scene for display; it is never fed back into the world-model latent state.
+
 ## How It Works
 
 1. **Preprocessing** — Extracts frames from a video, estimates camera motion between consecutive frames using Farneback optical flow, and saves frame-action pairs.
 2. **Training** — Trains an image autoencoder (encoder/decoder) to compress frames into latent feature maps, and a Latent U-Net that predicts the next latent state given the current latent and an action vector. Synthetic camera-warps are used as data augmentation to teach the model how keyboard-driven movement should affect the scene.
-3. **Play** — Starts from a random real frame, then runs the latent transition model in a loop. At each step, the current pixel frame is warped by a physical camera transform based on your keyboard input, encoded into the latent space, blended with the learned transition prediction, and decoded into the next frame. This hybrid approach keeps the output stable while incorporating learned scene dynamics.
+3. **Idle scene regeneration** — The reconstructor learns complete-frame targets from degraded versions of the original video. When the player is idle, it uses the current generated frame as a cue and produces a full regenerated scene from its learned video prior. The result is display-only and never influences the latent world state.
+4. **Play** — Starts from a random real frame, then runs the latent transition model in a loop. At each step, the current pixel frame is warped by a physical camera transform based on your keyboard input, encoded into the latent space, blended with the learned transition prediction, and decoded into the next frame. This hybrid approach keeps the output stable while incorporating learned scene dynamics.
 
 ## Installation
 
@@ -74,11 +77,27 @@ python main.py train --project <name> [--epochs 50] [--batch-size 2] [--accum-st
                       [--device cpu] [--no-synthetic-controls] [--synthetic-strength 0.12]
   Train the autoencoder and latent transition model.
 
+python main.py reconstructor --project <name> [--epochs 12] [--resume]
+                             [--batch-size 16] [--lr 0.0003] [--patch-size 64]
+                             [--device cpu] [--compile]
+  Train only the whole-scene reconstructor. With `--resume`, continue from
+  `checkpoints/reconstructor.pt` without retraining the world model. By default,
+  training uses complete frames; pass `--patch-size N` only when patch training
+  is intentionally desired.
+
+python main.py verify --project <name>
+  Run read-only checks for processed data and loadable checkpoints.
+
 python main.py play --project <name> [--fps 30] [--action-strength 1.0] [--device cpu]
   Launch the interactive world model.
 
 python main.py gui
   Open the Tkinter desktop interface.
+
+The GUI uses native `ttk` controls and includes a Dashboard for pipeline
+status, read-only verification, live job progress, elapsed time, expanded
+world-model and reconstructor options, checkpoint resume controls, and
+display/playback settings.
 ```
 
 ## Training Tips

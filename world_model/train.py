@@ -82,6 +82,7 @@ def train_world_model(
     synthetic_controls: bool = True,
     synthetic_strength: float = 0.12,
     grad_checkpoint: bool = True,
+    progress_fn=None,
 ) -> Path:
     paths = ProjectPaths(Path(project))
     if not paths.frames_file.exists() or not paths.actions_file.exists():
@@ -208,6 +209,8 @@ def train_world_model(
 
         scheduler.step()
         print(f"epoch {epoch}: loss={total / max(1, n_batches):.4f}")
+        if progress_fn:
+            progress_fn(epoch, epochs)
         _free_memory(device)
 
         if epoch % save_every == 0 or epoch == epochs:
